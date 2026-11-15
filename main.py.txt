@@ -1,0 +1,141 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json, os, random, string, asyncio, datetime, threading
+from flask import Flask
+
+# Render braucht das, damit er nicht einschläft
+app = Flask(__name__)
+@app.route('/')
+def home(): return "Bot ist online!"
+threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))).start()
+
+LOG_CHANNEL = 1571475976905433171
+REDEEM_CHANNEL = 1571475976905433171
+TICKET_KEYWORDS = ["ticket", "bestellung", "buy", "shop", "order"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "DEIN_TOKEN_HIER")
+
+intents = discord.Intents.default()
+intents.members = True
+intents.invites = True
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+def load_json(name, default):
+    if os.path.exists(name):
+        try:
+            with open(name, "r", encoding="utf-8") as f: return json.load(f)
+        except: return default
+    return default
+
+invite_data = load_json("invites.json", {})
+discount_config = load_json("discounts.json", {"3": 10, "5": 25, "10": 50, "15": 100})
+codes_data = load_json("codes.json", {})
+invites_cache = {}
+
+def save_all():
+    with open("invites.json", "w", encoding="utf-8") as f: json.dump(invite_data, f, indent=2)
+    with open("discounts.json", "w", encoding="utf-8") as f: json.dump(discount_config, f, indent=2)
+    with open("codes.json", "w", encoding="utf-8") as f: json.dump(codes_data, f, indent=2)
+
+def get_discount(count):
+    rabatt = 0
+    for k,v in sorted(discount_config.items(), key=lambda x: int(x[0])):
+        if count >= int(k): rabatt = v
+    return rabatt
+
+def gen_unique_code(owner, discount, invites, ticket_channel_id):
+    while True:
+        rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        code = f"BB-{discount}-{rand}"
+        if code not in codes_data:
+            codes_data[code] = {"owner_id": owner.id, "owner_name": owner.name, "invites": invites, "discount": discount, "used": False, "ticket_channel_id": ticket_channel_id, "created_at": datetime.datetime.now().isoformat()}
+            save_all()
+            return code
+
+@bot.event
+async def on_ready():
+    print(f"✅ {bot.user} ONLINE")
+    await bot.tree.sync()
+    for g in bot.guilds:
+        try:
+            invs = await g.invites()
+            invites_cache[g.id] = {i.code: i.uses for i in invs}
+        except: pass
+
+@bot.event
+async def on_member_join(member):
+    try:
+        new_invites = await member.guild.invites()
+        old = invites_cache.get(member.guild.id, {})
+        for inv in new_invites:
+            if old.get(inv.code, 0) < inv.uses:
+                iid = str(inv.inviter.id)
+                invite_data[iid] = invite_data.get(iid, 0) + 1
+                save_all()
+                break
+        invites_cache[member.guild.id] = {i.code: i.uses for i in new_invites}
+    except: pass
+
+@bot.event
+async def on_guild_channel_create(channel):
+    if not isinstance(channel, discord.TextChannel): return
+    if not any(k in channel.name.lower() for k in TICKET_KEYWORDS): return
+    await asyncio.sleep(2.5)
+    owner = None
+    for target, ow in channel.overwrites.items():
+        if isinstance(target, discord.Member) and not target.bot and not target.guild_permissions.manage_channels:
+            if ow.read_messages: owner = target; break
+    if not owner: return
+    count = invite_data.get(str(owner.id), 0)
+    discount = get_discount(count)
+    if discount == 0:
+        await channel.send(embed=discord.Embed(title="Kein Rabatt", description=f"{owner.mention} du hast {count}/3 Invites", color=0xFF0000))
+        return
+    code = gen_unique_code(owner, discount, count, channel.id)
+    et = discord.Embed(title="🎟️ Dein persönlicher Rabatt Code", description=f"{owner.mention} **{count} Invites** = **{discount}%**", color=0x00FF00)
+    et.add_field(name="🎫 EINMALIGER CODE", value=f"```{code}```", inline=False)
+    et.set_footer(text="Jeder Code ist einmalig und nur 1x gültig!")
+    await channel.send(content=owner.mention, embed=et)
+    tc = bot.get_channel(REDEEM_CHANNEL)
+    if tc:
+        e = discord.Embed(title="🆕 Neuer Code", description=f"{channel.mention} von {owner.mention}", color=0xFFD700)
+        e.add_field(name="Code", value=f"`{code}`", inline=False)
+        e.add_field(name="Rabatt", value=f"{discount}% bei {count} Invites", inline=False)
+        await tc.send(embed=e)
+
+@bot.tree.command(name="redeem", description="[TEAM] Code einlösen")
+async def redeem(interaction: discord.Interaction, code: str):
+    if interaction.channel_id != REDEEM_CHANNEL:
+        await interaction.response.send_message(f"❌ Nur in <#{REDEEM_CHANNEL}>!", ephemeral=True)
+        return
+    code = code.upper().strip()
+    data = codes_data.get(code)
+    if not data: await interaction.response.send_message(f"❌ Code existiert nicht!", ephemeral=True); return
+    if data["used"]: await interaction.response.send_message(f"⚠️ Schon benutzt!", ephemeral=True); return
+    codes_data[code]["used"] = True
+    codes_data[code]["used_at"] = datetime.datetime.now().strftime("%d.%m %H:%M")
+    codes_data[code]["redeemed_by"] = interaction.user.id
+    save_all()
+    embed = discord.Embed(title="✅ CODE EINGELÖST!", color=0x00FF00)
+    embed.add_field(name="Code", value=f"`{code}`", inline=True)
+    embed.add_field(name="Kunde", value=f"<@{data['owner_id']}>", inline=True)
+    embed.add_field(name="Rabatt geben", value=f"**{data['discount']}%**", inline=True)
+    await interaction.response.send_message(embed=embed)
+    try:
+        ch = bot.get_channel(data["ticket_channel_id"])
+        if ch: await ch.send(embed=discord.Embed(title="✅ Rabatt Bestätigt!", description=f"Code `{code}` bestätigt! Du bekommst **{data['discount']}%**!", color=0x00FF00))
+    except: pass
+
+@bot.tree.command(name="invites", description="Invites sehen")
+async def invites_slash(interaction: discord.Interaction, user: discord.Member = None):
+    user = user or interaction.user
+    await interaction.response.send_message(f"📊 {user.mention}: {invite_data.get(str(user.id),0)} Invites = {get_discount(invite_data.get(str(user.id),0))}%", ephemeral=True)
+
+@bot.tree.command(name="setdiscount", description="[ADMIN] Rabatt setzen")
+@app_commands.checks.has_permissions(administrator=True)
+async def setdiscount(interaction: discord.Interaction, invites: int, rabatt: int):
+    discount_config[str(invites)] = rabatt; save_all()
+    await interaction.response.send_message(f"✅ Ab {invites} = {rabatt}%", ephemeral=True)
+
+bot.run(BOT_TOKEN)
